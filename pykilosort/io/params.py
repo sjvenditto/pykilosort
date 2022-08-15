@@ -4,39 +4,11 @@ from math import ceil
 import numpy as np
 from pydantic import BaseModel, Field, validator
 
-from .utils import Bunch
+from pykilosort.utils import Bunch
+from .probes import Probe
 
 # TODO: design - Let's move all of this to a yaml file with sections so that its easier to read.
 #              - We can then just parse the yaml file to generate this.
-
-
-class Probe(BaseModel):
-    NchanTOT: int
-    Nchan: t.Optional[int] = Field(
-        None, description="Nchan < NchanTOT if some channels should not be used."
-    )
-
-    chanMap: np.ndarray  # TODO: add constraints
-    kcoords: np.ndarray  # TODO: add constraints
-    xc: np.ndarray
-    yc: np.ndarray
-
-    @validator("yc")
-    def coords_same_length(cls, v, values):
-        assert len(values["xc"]) == len(v)
-        return v
-
-    class Config:
-        arbitrary_types_allowed = True
-
-    @classmethod
-    def load_from_npy(cls, rootZ, **kwargs):
-        return cls(
-            chanMap=np.load(f"{rootZ}/channel_map.npy").flatten().astype(int),
-            xc=np.load(rootZ + "/channel_positions.npy")[:, 0],
-            yc=np.load(rootZ + "/channel_positions.npy")[:, 1],
-            **kwargs,
-        )
 
 
 class DatashiftParams(BaseModel):
@@ -59,6 +31,16 @@ class DatashiftParams(BaseModel):
 
 
 class KilosortParams(BaseModel):
+
+    template_snapshot_times: t.List[float] = Field([], description='points in each recording to take'
+            'snapshots of the template waveforms. should be values between 0 and 1 where 0.2 means'
+            '20% of the way through each recording for instance')
+
+    channel_shift_alignment: bool = Field(True, description='perform channel alignemnt if channel'
+                                                            'shifts are provided')
+
+    drift_across_recordings: bool = Field(True, description='perform drift correction across'
+                                                            'multiple recordings')
     
     low_memory: bool = Field(
         False, description='low memory setting for running chronic recordings'
@@ -69,7 +51,7 @@ class KilosortParams(BaseModel):
     preprocessing_function: str = Field('kilosort2', description='pre-processing function used choices'
                                                                  'are "kilosort2" or "destriping"')
     
-    save_drift_spike_detections: bool = Field(False, description='save detected spikes in drift correction')
+    save_drift_spike_detections: bool = Field(True, description='save detected spikes in drift correction')
     
     perform_drift_registration: bool = Field(False, description='Estimate electrode drift and apply registration')
 
@@ -80,12 +62,10 @@ class KilosortParams(BaseModel):
 
     data_dtype: str = Field('int16', description='data type of raw data')
 
-    n_channels: int = Field(385, description='number of channels in the data recording')
-
     probe: t.Optional[Probe] = Field(None, description="recording probe metadata")
 
     save_temp_files: bool = Field(
-        True, description="keep temporary files created while running"
+        False, description="keep temporary files created while running"
     )
 
     fshigh: float = Field(300.0, description="high pass filter frequency")
@@ -219,14 +199,14 @@ class KilosortParams(BaseModel):
     loc_range: t.List[int] = [5, 4]
     long_range: t.List[int] = [30, 6]
 
-    Nfilt: t.Optional[
-        int
-    ] = None  # This should be a computed property once we add the probe to the config
-
     # TODO: Make this true by default
     read_only: bool = Field(False, description='Read only option for raw data')
 
     # Computed properties
+    @property
+    def Nfilt(self) -> int:
+        return self.nfilt_factor * self.probe.n_channels
+
     @property
     def NT(self) -> int:
         return 64 * 1024 + self.ntbuff
@@ -243,7 +223,7 @@ class KilosortParams(BaseModel):
     def ephys_reader_args(self):
         "Key word arguments passed to ephys reader"
         args = {
-            'n_channels': self.n_channels,
+            'n_channels': self.probe.n_channels_total,
             'dtype': self.data_dtype,
             'sample_rate': self.fs,
         }

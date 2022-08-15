@@ -1,6 +1,5 @@
 import logging
 import shutil
-import os
 from pathlib import Path, PurePath
 
 import numpy as np
@@ -8,11 +7,11 @@ import numpy as np
 from .preprocess import preprocess, get_good_channels, get_whitening_matrix, get_Nbatch, destriping
 from .cluster import clusterSingleBatches
 from .datashift2 import datashift2
-from .learn import learnAndSolve8b, compress_templates
+from .learn import learnAndSolve8b
 from .postprocess import find_merges, splitAllClusters, set_cutoff, rezToPhy
 from .utils import Bunch, Context, memmap_large_array, load_probe, copy_bunch, DataLoader, \
                 RawDataLoader
-from .params import KilosortParams
+from pykilosort.io.params import KilosortParams
 
 logger = logging.getLogger(__name__)
 
@@ -26,34 +25,23 @@ def run(
     dat_path: str = None,
     dir_path: Path = None,
     output_dir: Path = None,
-    probe=None,
     stop_after=None,
     clear_context=False,
     **params,
 ):
-    """Launch KiloSort 2.
-
-    probe has the following attributes:
-    - xc
-    - yc
-    - kcoords
-    - Nchan
-
+    """
+    Launch KiloSort 2.
     """
 
     # Get or create the probe object.
-    if isinstance(probe, (str, Path)):
-        probe = load_probe(probe)
+    if 'probe' in params.keys() and isinstance(params['probe'], (str, Path)):
+        params['probe'] = load_probe(params['probe'])
 
     # Get params.
     params = KilosortParams(**params or {})
     assert params
 
     raw_data = RawDataLoader(dat_path, **params.ephys_reader_args)
-
-    # Get probe.
-    probe = probe or default_probe(raw_data)
-    assert probe
 
     # dir path
     if type(dat_path) == list:
@@ -64,6 +52,9 @@ def run(
     dir_path = Path(dir_path)
     dir_path.mkdir(exist_ok=True, parents=True)
     assert dir_path.exists()
+
+    output_dir = output_dir or dir_path / 'output'
+    output_dir.mkdir(exist_ok=True, parents=True)
 
     # Create the context.
     ctx_path = dir_path / ".kilosort" / Path(raw_data.name).name
@@ -77,8 +68,7 @@ def run(
 
     ctx = Context(ctx_path)
     ctx.params = params
-    ctx.probe = probe
-    ctx.raw_probe = copy_bunch(probe)
+    ctx.raw_probe = params.probe.copy(deep=True)
     ctx.raw_data = raw_data
 
     # Load the intermediate results to avoid recomputing things.
@@ -100,7 +90,7 @@ def run(
             # determine bad channels
             with ctx.time("good_channels"):
                 ir.igood = get_good_channels(
-                    raw_data=raw_data, probe=probe, params=params
+                    raw_data=raw_data, probe=params.probe, params=params
                 )
             # Cache the result.
             ctx.write(igood=ir.igood)
@@ -110,17 +100,12 @@ def run(
         # it's enough to remove bad channels from the channel map, which treats them
         # as if they are dead
         ir.igood = ir.igood.ravel().astype("bool")
-        probe.chanMap = probe.chanMap[ir.igood]
-        probe.xc = probe.xc[ir.igood]  # removes coordinates of bad channels
-        probe.yc = probe.yc[ir.igood]
-        probe.kcoords = probe.kcoords[ir.igood]
-    probe.Nchan = len(
-        probe.chanMap
-    )  # total number of good channels that we will spike sort
-    assert probe.Nchan > 0
+        params.probe.channel_map = params.probe.channel_map[ir.igood]
+        params.probe.xcoords = params.probe.xcoords[ir.igood]  # removes coordinates of bad channels
+        params.probe.ycoords = params.probe.ycoords[ir.igood]
+        params.probe.channel_groups = params.probe.channel_groups[ir.igood]
 
-    # upper bound on the number of templates we can have
-    params.Nfilt = params.nfilt_factor * probe.Nchan
+    assert params.probe.n_channels > 0
 
     # -------------------------------------------------------------------------
     # Find the whitening matrix.
@@ -129,7 +114,7 @@ def run(
         # of the data
         with ctx.time("whitening_matrix"):
             ir.Wrot = get_whitening_matrix(
-                raw_data=raw_data, probe=probe, params=params
+                raw_data=raw_data, probe=params.probe, params=params
             )
         # Cache the result.
         ctx.write(Wrot=ir.Wrot)
@@ -149,10 +134,13 @@ def run(
     if stop_after == "preprocess":
         return ctx
 
+    # Close the files in the raw data loader
+    raw_data.close()
+
     # Open the proc file.
     # NOTE: now we are always in Fortran order.
     assert ir.proc_path.exists()
-    ir.data_loader = DataLoader(ir.proc_path, params.NT, probe.Nchan, params.scaleproc)
+    ir.data_loader = DataLoader(ir.proc_path, params.NT, params.probe.n_channels, params.scaleproc)
 
     # -------------------------------------------------------------------------
     # # Time-reordering as a function of drift.
@@ -169,10 +157,11 @@ def run(
     #     return ctx
 
 
-    if params.perform_drift_registration:
+    if params.perform_drift_registration or \
+        (params.drift_across_recordings and raw_data.multiple_datasets == True):
         if "drift_correction" not in ctx.timer.keys():
             with ctx.time("drift_correction"):
-                out = datashift2(ctx)
+                out = datashift2(ctx, output_dir)
             ctx.save(**out)
     else:
         ctx.intermediate.iorig = np.arange(ctx.intermediate.Nbatch)
@@ -197,7 +186,7 @@ def run(
     #
     if "learn" not in ctx.timer.keys():
         with ctx.time("learn"):
-            out = learnAndSolve8b(ctx)
+            out = learnAndSolve8b(ctx, break_points = raw_data.break_points)
         ctx.save(**out)
     if stop_after == "learn":
         return ctx
@@ -299,8 +288,8 @@ def run(
     # Show timing information.
     ctx.show_timer()
 
-    #TODO:
-    # Add optional deletion of temp files
+    if not params.save_temp_files:
+        ctx.delete_temp_files()
 
 
 # TODO: use these in the actual main function
@@ -325,7 +314,7 @@ def run_preprocess(ctx):
         probe.chanMap = probe.chanMap[ir.igood]
         probe.xc = probe.xc[ir.igood]  # removes coordinates of bad channels
         probe.yc = probe.yc[ir.igood]
-        probe.kcoords = probe.kcoords[ir.igood]
+        probe.channel_groups = probe.channel_groups[ir.igood]
 
     probe.Nchan = len(
         probe.chanMap
