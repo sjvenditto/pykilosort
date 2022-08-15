@@ -1,6 +1,8 @@
 import numpy as np
+import re
 
 from ..utils import Bunch
+from DemoReadSGLXData.readSGLX import readMeta
 
 
 """ Some standard probe geometries - please check before using! """
@@ -26,6 +28,28 @@ def np2_probe():
     probe.kcoords = np.zeros(384)
     return probe
 
+def np2_probe_sglx(meta_path):
+    """ Returns a Neuropixels 2 probe as a Bunch object for use in pykilosort """
+    probe = Bunch()
+    meta = readMeta(meta_path)
+    probe.NchanTOT = 385
+    
+    p1 = re.compile('\(\d+:\d+:\d+:\d+\)')
+    chan_meta = p1.findall(meta['snsShankMap'])
+    p2 = re.compile(r':')
+    
+    probe.chanMap = np.arange(384)
+    probe.xc = np.zeros(384)
+    probe.yc = np.zeros(384)
+    probe.kcoords = np.zeros(384)
+    
+    for (channel,cmeta) in zip(probe.chanMap,chan_meta):
+        m = p2.split(cmeta[1:-1])
+        shank = int(m[0])
+        probe.xc[channel] = int(m[1])*32 + shank*200
+        probe.yc[channel] = int(m[2])*15
+    
+    return probe
 
 def get_4shank_channels_np2(shank):
     """
