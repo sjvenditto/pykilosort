@@ -1,4 +1,4 @@
-from math import floor, log
+from math import floor
 import logging
 import os
 
@@ -7,9 +7,6 @@ import numpy as np
 import cupy as cp
 from scipy.interpolate import Akima1DInterpolator
 from scipy.sparse import coo_matrix
-import matplotlib.pyplot as plt
-
-from brainbox.processing import bincount2D
 
 from .postprocess import my_conv2_cpu
 from .learn import extractTemplatesfromSnippets
@@ -362,7 +359,7 @@ def get_kernel_matrix(probe, shifts, sig):
     """
 
     # 2D coordinates of the original channel positions
-    coords_old = np.vstack([probe.xcoords, probe.ycoords]).T
+    coords_old = np.vstack([probe.xc, probe.yc]).T
 
     # 2D coordinates of the new channel positions
     coords_new = np.copy(coords_old)
@@ -392,7 +389,7 @@ def apply_drift_transform(dat, shifts_in, ysamp, probe, sig):
     """
 
     # upsample to get shifts for each channel
-    shifts = interpolate_1D(shifts_in, ysamp, probe.ycoords)
+    shifts = interpolate_1D(shifts_in, ysamp, probe.yc)
 
     # kernel prediction matrix
     kernel_matrix = get_kernel_matrix(probe, shifts, sig)
@@ -448,10 +445,10 @@ def standalone_detector(wTEMP, wPCA, NrankPC, yup, xup, Nbatch, data_loader, pro
     # Get nearest channels for every template center.
     # Template products will only be computed on these channels.
     NchanNear = 10
-    iC, dist = getClosestChannels2(ycup, xcup, probe.ycoords, probe.xcoords, NchanNear)
+    iC, dist = getClosestChannels2(ycup, xcup, probe.yc, probe.xc, NchanNear)
 
     # Templates with centers that are far from an active site are discarded
-    dNearActiveSite = np.median(np.diff(np.unique(probe.ycoords)))
+    dNearActiveSite = np.median(np.diff(np.unique(probe.yc)))
     igood = dist[0, :] < dNearActiveSite
     iC = iC[:, igood]
     dist = dist[:, igood]
@@ -472,7 +469,7 @@ def standalone_detector(wTEMP, wPCA, NrankPC, yup, xup, Nbatch, data_loader, pro
     NchanUp = iC.shape[1]
     Params = (
         params.NT,
-        probe.n_channels,
+        probe.Nchan,
         params.nt0,
         NchanNear,
         NrankPC,
@@ -484,8 +481,8 @@ def standalone_detector(wTEMP, wPCA, NrankPC, yup, xup, Nbatch, data_loader, pro
     )
 
     # preallocate the results we assume 50 spikes per channel per second max
-    rl = data_loader.data.shape[0] / params.fs / probe.n_channels   # record length
-    st3 = np.zeros((int(np.ceil(rl * 50 * probe.n_channels)), 5))
+    rl = data_loader.data.shape[0] / params.fs / probe.Nchan   # record length
+    st3 = np.zeros((int(np.ceil(rl * 50 * probe.Nchan)), 5))
     st3[:, 4] = -1  # batch_id can be zero
     t0 = 0
     nsp = 0  # counter for total number of spikes
@@ -501,7 +498,7 @@ def standalone_detector(wTEMP, wPCA, NrankPC, yup, xup, Nbatch, data_loader, pro
         )
         # upsample the y position using the center of mass of template products
         # coming out of the CUDA function.
-        ys = probe.ycoords[cp.asnumpy(iC)]
+        ys = probe.yc[cp.asnumpy(iC)]
         cF0 = np.maximum(cF, 0)
         cF0 = cF0 / np.sum(cF0, 0)
         iChan = st[1, :]
@@ -546,7 +543,7 @@ def get_drift(spikes, probe, Nbatches, nblocks=5, genericSpkTh=10):
     :param Nbatches: No batches in the dataset
     :param nblocks: No of blocks to divide the probe into when estimating drift
     :param genericSpkTh: Min amplitude of spiking activity found
-    :return: drift_estimate: 2D numpy array of drift estimates per batch and per sub-block in um
+    :return: dshift: 2D numpy array of drift estimates per batch and per sub-block in um
                     size (Nbatches, 2*nblocks-1)
             yblk: 1D numpy array containing average y position of each sub-block
     """
@@ -555,9 +552,9 @@ def get_drift(spikes, probe, Nbatches, nblocks=5, genericSpkTh=10):
     dd = 5
 
     # min and max for the range of depths
-    dmin = min(probe.ycoords) - 1
+    dmin = min(probe.yc) - 1
 
-    dmax = int(1 + np.ceil((max(probe.ycoords) - dmin) / dd))
+    dmax = int(1 + np.ceil((max(probe.yc) - dmin) / dd))
 
     # preallocate matrix of counts with 20 bins, spaced logarithmically
     F = np.zeros((dmax, 20, Nbatches))
@@ -597,115 +594,27 @@ def get_drift(spikes, probe, Nbatches, nblocks=5, genericSpkTh=10):
     return dshift, yblk
 
 
-def average_drift_across_days(drift_estimate, recording_times, batch_size):
-    """
-    For each day takes the median estimated drift
-    :param drift_estimate: Drift estimates across batches, numpy array (n_batches, n_blocks)
-    :param recording_times: List of times (in samples) when a new recording starts, including 0 at
-                            the start and the end time of the final recording
-    :param batch_size: Size of each batch in time samples
-    :return: drift_estimate: New estimate after averaging
-    """
-    for recording_id in range(len(recording_times) - 1):
-
-        start_batch = int(recording_times[recording_id] // batch_size)
-        end_batch = int(recording_times[recording_id + 1] // batch_size)
-
-        # Special care for last recording to make sure the index is correct
-        if recording_id == len(recording_times) - 2:
-            end_batch = drift_estimate.shape[0]
-
-        drift_estimate[start_batch:end_batch] = np.median(drift_estimate[start_batch:end_batch], axis=0)
-
-    return drift_estimate
-
-
-def calculate_correct_depths(spike_times, spike_depths, drift_estimate, yblk, batch_size=65600):
-    """
-    Uses the estimated drift estimates across times and
-    :param spike_times: numpy array, (n_spikes)
-    :param spike_depths: numpy array (n_spikes)
-    :param drift_estimate: Drift estimates for each time batch and probe section
-        numpy array, (n_batches, n_sections)
-    :param yblk: center y-coordinate for each section
-        numpy array, (n_sections)
-    :param batch_size: int
-    :return:
-    """
-
-    spike_batches = (spike_times // batch_size).astype('int')
-    n_batches = max(spike_batches) + 1
-    assert n_batches <= drift_estimate.shape[0]
-
-    ymin = int(np.min(spike_depths)) - 2
-    ymax = int(np.max(spike_depths)) + 2
-
-    spike_depths_corrected = np.zeros_like(spike_depths)
-
-    # Perform corrections for each time batch
-    for i in tqdm(range(n_batches), desc='Estimating Shifted Spike Depths'):
-
-        # Interpolate the drift estimates across all depths
-        shifts = interpolate_1D(drift_estimate[i], yblk, np.arange(ymin, ymax))
-
-        # Use this to get the corrected depths for all spikes in the batch
-        ix = np.where(spike_batches == i)[0]
-        depth_ints = spike_depths[ix].astype('int') - ymin
-        spike_depths_corrected[ix] = spike_depths[ix] + shifts[depth_ints]
-
-    return spike_depths_corrected
-
-
-def save_drift_plot(spike_times, spike_depths, save_path, d_bin, title=None, **kwargs):
-    """
-    Creates and saves a drift plot, copied and modified from IBL's brainbox.plot driftmap function
-    :param spike_times: numpy array, seconds
-    :param spike_depths: numpy array, um
-    :param save_path:
-    :param d_bin: binning width for spike depth
-    :param title:
-    :return:
-    """
-    fig, ax = plt.subplots(figsize=(20, 12))
-
-    # Use the maximum spike time to estimate a reasonable time bin width
-    t_bin = 10 ** (max(floor(log(np.max(spike_times), 10)) - 4, -1))
-
-    # compute raster map as a function of site depth
-    R, times, depths = bincount2D(spike_times, spike_depths, t_bin, d_bin)
-
-    # plot raster map
-    ax.imshow(R, aspect='auto', cmap='binary', vmin=0, vmax=np.std(R) * 4,
-              extent=np.r_[times[[0, -1]], depths[[0, -1]]], origin='lower', **kwargs)
-
-    ax.set_xlabel('time (secs)')
-    ax.set_ylabel('depth (um)')
-
-    if title is not None:
-        ax.set_title(title)
-
-    plt.savefig(save_path, bbox_inches='tight')
-
-
-def datashift2(ctx, output_dir):
+def datashift2(ctx):
     """
     Main function to re-register the preprocessed data
     """
     params = ctx.params
-    probe = params.probe
+    probe = ctx.probe
     raw_data = ctx.raw_data
     ir = ctx.intermediate
     Nbatch = ir.Nbatch
 
+    ir.xc, ir.yc = probe.xc, probe.yc
+
     # The min and max of the y and x ranges of the channels
-    ymin = min(probe.ycoords)
-    ymax = max(probe.ycoords)
-    xmin = min(probe.xcoords)
-    xmax = max(probe.xcoords)
+    ymin = min(ir.yc)
+    ymax = max(ir.yc)
+    xmin = min(ir.xc)
+    xmax = max(ir.xc)
 
     # Determine the average vertical spacing between channels.
     # Usually all the vertical spacings are the same, i.e. on Neuropixels probes.
-    dmin = np.median(np.diff(np.unique(probe.ycoords)))
+    dmin = np.median(np.diff(np.unique(ir.yc)))
     logger.info(f"pitch is {dmin} um")
     yup = np.arange(
         start=ymin, step=dmin / 2, stop=ymax + (dmin / 2)
@@ -733,29 +642,15 @@ def datashift2(ctx, output_dir):
         wTEMP, wPCA, params.nPCs, yup, xup, Nbatch, ir.data_loader, probe, params
     )
 
-    dshift, yblk = get_drift(spikes, probe, Nbatch, params.nblocks, params.genericSpkTh)
-
-    if params.drift_across_recordings and not params.perform_drift_registration:
-        average_drift_across_days(dshift, raw_data.n_samples, params.NT)
-
     if params.save_drift_spike_detections:
-        drift_path = output_dir / 'drift'
+        drift_path = ctx.context_path / 'drift'
         if not os.path.isdir(drift_path):
             os.mkdir(drift_path)
         np.save(drift_path / 'spike_times.npy', spikes.times)
         np.save(drift_path / 'spike_depths.npy', spikes.depths)
         np.save(drift_path / 'spike_amps.npy', spikes.amps)
-        np.save(drift_path / 'drift_estimate.npy', dshift)
-        np.save(drift_path / 'yblk.npy', yblk)
 
-        spikes_depths_corrected = calculate_correct_depths(spikes.times, spikes.depths, dshift,
-                                                           yblk, batch_size=params.NT)
-        np.save(drift_path / 'spike_depths_corrected.npy', spikes_depths_corrected)
-
-        save_drift_plot(spikes.times / params.fs, spikes.depths, d_bin=dmin, title='Uncorrected Spike Depths',
-                        save_path=drift_path / 'uncorrected_spike_depths.png')
-        save_drift_plot(spikes.times / params.fs, spikes_depths_corrected, d_bin=dmin, title='Corrected Spike Depths',
-                        save_path=drift_path / 'corrected_spike_depths.png')
+    dshift, yblk = get_drift(spikes, probe, Nbatch, params.nblocks, params.genericSpkTh)
 
     # sort in case we still want to do "tracking"
     iorig = np.argsort(np.mean(dshift, axis=1))

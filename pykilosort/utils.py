@@ -1,4 +1,3 @@
-import os
 from contextlib import contextmanager
 from functools import reduce
 import json
@@ -8,7 +7,6 @@ from pathlib import Path, PurePath
 import operator
 import os.path as op
 import re
-import shutil
 from time import perf_counter
 
 from tqdm.auto import tqdm
@@ -17,7 +15,6 @@ from numpy.lib.format import (
     _check_version, _write_array_header, header_data_from_array_1_0, dtype_to_descr)
 import cupy as cp
 
-import phylib
 from phylib.io.traces import get_ephys_reader
 
 from .event import emit, connect, unconnect  # noqa
@@ -75,7 +72,7 @@ def _extend(x, i0, i1, val, axis=0):
         assert x.shape[axis] == i1
     s = [slice(None, None, None)] * x.ndim
     s[axis] = slice(i0, i1, 1)
-    x[tuple(s)] = val
+    x[s] = val
     for i in range(x.ndim):
         if i != axis:
             assert x.shape[i] == shape[i]
@@ -307,20 +304,15 @@ class RawDataLoader(object):
                         'All datasets must have the same number of channels'
                 self.n_samples.append(n_samples)
                 self.raw_data.append(raw_dataset)
+            self.n_samples = np.cumsum(np.array(self.n_samples))
 
-            self.n_samples = np.cumsum(np.array(self.n_samples, dtype='int64'))
-
-    @property
-    def break_points(self):
-        if not self.multiple_datasets:
-            return [0, self.n_samples]
-        return self.n_samples
 
     @property
     def total_length(self):
         if not self.multiple_datasets:
             return self.n_samples
-        return self.n_samples[-1]
+        else:
+            return self.n_samples[-1]
 
     @property
     def shape(self):
@@ -330,7 +322,8 @@ class RawDataLoader(object):
     def name(self):
         if not self.multiple_datasets:
             return Path(self.raw_data.name).name
-        return Path(self.raw_data[0].name).name
+        else:
+            return Path(self.raw_data[0].name).name
 
 
     # Slice implementation for ease of use
@@ -384,26 +377,6 @@ class RawDataLoader(object):
 
                 return np.concatenate((sub_batch_0, sub_batch_1), axis=0)
 
-    def close(self):
-        if self.multiple_datasets:
-            for reader in self.raw_data:
-                close_ephys_reader(reader)
-        else:
-            close_ephys_reader(self.raw_data)
-
-
-def close_ephys_reader(ephys_reader):
-    """
-    Close a phylib BaseEphysReader object so it can be deleted safely
-    :param ephys_reader:
-    """
-
-    # FlatEphysReader object uses numpy'e memmap method which needs to be explicity closed
-    if isinstance(ephys_reader, phylib.io.traces.FlatEphysReader):
-        ephys_reader._mmaps[0]._mmap.close()
-
-    if isinstance(ephys_reader, phylib.io.traces.MtscompEphysReader):
-        ephys_reader.reader.close()
 
 
 class DataLoader(object):
@@ -578,14 +551,6 @@ class Context(Bunch):
         kwargs = kwargs or self.intermediate
         self.write(**kwargs)
 
-    def delete_temp_files(self):
-        """ Deletes temporary files from disk at the end of a run"""
-        shutil.rmtree(self.context_path)
-
-        # Delete .kilosort parent folder if empty
-        if self.context_path.parent.name == '.kilosort' and len(os.listdir(self.context_path.parent)) == 0:
-            shutil.rmtree(self.context_path.parent)
-
     @contextmanager
     def time(self, name):
         """Context manager to measure the time of a section of code."""
@@ -628,7 +593,7 @@ def load_probe(probe_path):
     """Load a .mat probe file from Kilosort2, or a PRB file (experimental)."""
 
     # A bunch with the following attributes:
-    _required_keys = ('NchanTOT', 'channel_map', 'xc', 'yc', 'channel_groups')
+    _required_keys = ('NchanTOT', 'chanMap', 'xc', 'yc', 'kcoords')
     probe = Bunch()
     probe.NchanTOT = 0
     probe_path = Path(probe_path).resolve()
@@ -662,8 +627,8 @@ def load_probe(probe_path):
         probe.xc = mat['xcoords'].ravel().astype(np.float64)
         nc = len(probe.xc)
         probe.yc = mat['ycoords'].ravel().astype(np.float64)
-        probe.kcoords = mat.get('channel_groups', np.zeros(nc)).ravel().astype(np.float64)
-        probe.chanMap = (mat['channel_map'] - 1).ravel().astype(np.int32)  # NOTE: 0-indexing in Python
+        probe.kcoords = mat.get('kcoords', np.zeros(nc)).ravel().astype(np.float64)
+        probe.chanMap = (mat['chanMap'] - 1).ravel().astype(np.int32)  # NOTE: 0-indexing in Python
         probe.NchanTOT = len(probe.chanMap)  # NOTE: should match the # of columns in the raw data
 
     for n in _required_keys:
@@ -680,12 +645,12 @@ def create_prb(probe):
     except AttributeError:
         bad_channels = np.array([])
     probe_prb = {}
-    unique_channel_groups = np.unique(np.array(probe.channel_groups))
+    unique_channel_groups = np.unique(np.array(probe.kcoords))
 
     for channel_group in unique_channel_groups:
         probe_prb[channel_group] = {}
 
-        channel_group_pos = np.where(probe.channel_groups == channel_group)
+        channel_group_pos = np.where(probe.kcoords == channel_group)
         group_channels = chan_map[channel_group_pos]
         group_xc = xc[channel_group_pos]
         group_yc = yc[channel_group_pos]

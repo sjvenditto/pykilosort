@@ -689,7 +689,7 @@ def find_merges(ctx):
     # TODO: move_to_config
     dt = 1. / 1000  # step size for CCG binning
     nbins = 500  # number of bins used for cross-correlograms
-    NchanNear = min(ctx.params.probe.n_channels, 32)
+    NchanNear = min(ctx.probe.Nchan, 32)
     Nrank = 3
 
     # (DEV_NOTES) nbins is not a variable in Marius' code, I include it here to avoid
@@ -781,9 +781,9 @@ def splitAllClusters(ctx, flag):
     # it only uses the PC features for each spike, stored in ir.cProjPC
 
     params = ctx.params
-    probe = params.probe
+    probe = ctx.probe
     ir = ctx.intermediate
-    n_channels = ctx.params.probe.n_channels
+    Nchan = ctx.probe.Nchan
 
     wPCA = cp.asarray(ir.wPCA)  # use PCA projections to reconstruct templates when we do splits
     assert wPCA.shape[1] == 3
@@ -805,8 +805,8 @@ def splitAllClusters(ctx, flag):
     ccsplit = params.AUCsplit
 
     Nrank = 3
-    NchanNear = min(n_channels, 32)
-    Nnearest = min(n_channels, 32)
+    NchanNear = min(Nchan, 32)
+    Nnearest = min(Nchan, 32)
     sigmaMask = params.sigmaMask
 
     ik = -1
@@ -1055,8 +1055,9 @@ def splitAllClusters(ctx, flag):
 
     Nfilt = W.shape[1]  # new number of templates
     Nrank = 3
+    Nchan = probe.Nchan
     Params = cp.array(
-        [0, Nfilt, 0, 0, W.shape[0], Nnearest, Nrank, 0, 0, n_channels, NchanNear, nt0min, 0],
+        [0, Nfilt, 0, 0, W.shape[0], Nnearest, Nrank, 0, 0, Nchan, NchanNear, nt0min, 0],
         dtype=cp.float64)  # make a new Params to pass on parameters to CUDA
 
     # we need to re-estimate the spatial profiles
@@ -1069,8 +1070,6 @@ def splitAllClusters(ctx, flag):
     # we re-compute similarity scores between templates
     WtW, iList = getMeWtW(W.astype(cp.float32), U.astype(cp.float32), Nnearest)
     # ir.iList = iList  # over-write the list of nearest templates
-
-    orig_clusters = np.copy(cp.asnumpy(isplit))
 
     isplit = simScore == 1  # overwrite the similarity scores of clusters with same parent
     simScore = WtW.max(axis=2)
@@ -1108,7 +1107,6 @@ def splitAllClusters(ctx, flag):
         Wphy=cp.asnumpy(Wphy),
         iList=cp.asnumpy(iList),
         isplit=cp.asnumpy(isplit),
-        orig_clusters=orig_clusters,
     )
 
     if params.save_temp_files:
@@ -1264,7 +1262,6 @@ def checkClusters(ctx):
         ir.Wphy = ir.Wphy[:, good_units_mask, :]
         ir.iList = ir.iList[:, good_units_mask]
         ir.isplit = ir.isplit[good_units_mask][:, good_units_mask]
-        ir.orig_clusters = ir.orig_clusters[good_units_mask]
         ir.est_contam_rate = ir.est_contam_rate[good_units_mask]
         ir.Ths = ir.Ths[good_units_mask]
         ir.good = ir.good[good_units_mask]
@@ -1291,9 +1288,9 @@ def rezToPhy(ctx, dat_path=None, output_dir=None):
 
     ctx = checkClusters(ctx)  # check clusters integrity
 
+    probe = ctx.probe
     ir = ctx.intermediate
     params = ctx.params
-    probe = params.probe
 
     # spike_times will be in samples, not seconds
     W = ir.Wphy.astype(np.float32)
@@ -1344,13 +1341,20 @@ def rezToPhy(ctx, dat_path=None, output_dir=None):
 
     amplitudes = st3[:, 2]
 
+    Nchan = probe.Nchan
+
+    xcoords = probe.xc
+    ycoords = probe.yc
+    chanMap = probe.chanMap
+    chanMap0ind = chanMap  # - 1
+
     nt0, Nfilt = W.shape[:2]
 
     # (DEV_NOTES) 2 lines below can be combined
     # templates = cp.einsum('ikl,jkl->ijk', U, W).astype(cp.float32)
     # templates = cp.zeros((Nchan, nt0, Nfilt), dtype=np.float32, order='F')
     temp_amps_unscaled = np.zeros(Nfilt, dtype=np.float32)
-    templates_writer = NpyWriter(join(output_dir, 'templates.npy'), (Nfilt, nt0, probe.n_channels), np.float32)
+    templates_writer = NpyWriter(join(output_dir, 'templates.npy'), (Nfilt, nt0, Nchan), np.float32)
     for iNN in tqdm(range(Nfilt), desc="Computing templates"):
         t = np.dot(U[:, iNN, :], W[:, iNN, :].T).T
         templates_writer.append(t)
@@ -1362,7 +1366,7 @@ def rezToPhy(ctx, dat_path=None, output_dir=None):
     templates_writer.close()
     # templates = cp.transpose(templates, (2, 1, 0))  # now it's nTemplates x nSamples x nChannels
     # we include all channels so this is trivial
-    templatesInds = np.tile(np.arange(Nfilt), (probe.n_channels, 1))
+    templatesInds = np.tile(np.arange(Nfilt), (Nchan, 1))
 
     # here we compute the amplitude of every template...
 
@@ -1464,8 +1468,10 @@ def rezToPhy(ctx, dat_path=None, output_dir=None):
         # _save('templates', templates)
         _save('templates_ind', templatesInds)
 
-        _save('channel_map', probe.channel_map, dtype='int32')
-        _save('channel_positions', np.c_[probe.xcoords, probe.ycoords], np.float32)
+        chanMap0ind = chanMap0ind.astype(np.int32)
+
+        _save('channel_map', chanMap0ind)
+        _save('channel_positions', np.c_[xcoords, ycoords], np.float32)
 
         # _save('template_features', templateFeatures)
         # with open(join(output_dir, 'template_features.npy'), 'wb') as fp:
@@ -1483,12 +1489,6 @@ def rezToPhy(ctx, dat_path=None, output_dir=None):
         _save('whitening_mat_inv', whiteningMatrixInv)
 
         _save('thresholds', Ths)
-
-        snapshot_path = ctx.context_path / 'template_snapshots' / 'template_snapshots.npy'
-        if snapshot_path.is_file():
-            template_snapshots = np.load(snapshot_path)
-            template_snapshots = template_snapshots[ir.orig_clusters]
-            _save('template_snapshots', template_snapshots)
 
         if 'simScore' in ir:
             similarTemplates = simScore
@@ -1526,7 +1526,7 @@ def rezToPhy(ctx, dat_path=None, output_dir=None):
         if not os.path.exists(join(output_dir, 'params.py')):
             with open(join(output_dir, 'params.py'), 'w') as f:
                 f.write('dat_path = "../%s"\n' % dat_path)
-                f.write('n_channels_dat = %d\n' % probe.n_channels_total)
+                f.write('n_channels_dat = %d\n' % probe.NchanTOT)
                 f.write('dtype = "int16"\n')
                 f.write('offset = 0\n')
                 f.write('hp_filtered = False\n')

@@ -10,7 +10,7 @@ from ibllib.io import spikeglx
 from ibllib.ephys import spikes, neuropixel
 from one.alf.files import get_session_path
 from pykilosort import add_default_handler, run, Bunch, __version__
-from pykilosort.io.params import KilosortParams
+from pykilosort.params import KilosortParams
 
 
 _logger = logging.getLogger("pykilosort")
